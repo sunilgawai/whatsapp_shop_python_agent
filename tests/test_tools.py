@@ -11,8 +11,8 @@ class ShopToolsTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         settings = Settings(
-            openai_api_key="test-key",
-            openai_model="test-model",
+            gemini_api_key="test-key",
+            gemini_model="test-model",
             max_agent_iterations=3,
             database_path=str(Path(self.temp_dir.name) / "test.db"),
         )
@@ -79,6 +79,28 @@ class ShopToolsTests(unittest.TestCase):
 
         details = confirm_tools.get_product_details("Wireless Mouse")
         self.assertEqual(details["stock"], 20)
+
+    def test_conversation_history_is_saved_per_customer(self):
+        history = [
+            {"role": "user", "text": "What is the price of AirPods Pro?"},
+            {"role": "model", "text": "They cost ₹24,900."},
+        ]
+        self.database.save_conversation_history(self.customer_id, history)
+        self.assertEqual(
+            self.database.get_conversation_history(self.customer_id), history
+        )
+
+    def test_database_migration_adds_history_to_old_sessions_table(self):
+        with self.database.connect() as connection:
+            connection.execute("DROP TABLE customer_sessions")
+            connection.execute(
+                "CREATE TABLE customer_sessions ("
+                "customer_id TEXT PRIMARY KEY, previous_response_id TEXT)"
+            )
+        self.database.initialize()
+        self.assertEqual(
+            self.database.get_conversation_history(self.customer_id), []
+        )
 
 
 if __name__ == "__main__":

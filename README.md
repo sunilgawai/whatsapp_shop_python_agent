@@ -1,6 +1,6 @@
-# ShopBot — WhatsApp AI Sales Assistant (Learning MVP)
+# ShopBot — WhatsApp AI Sales Assistant (Gemini learning MVP)
 
-A small Python project that demonstrates an LLM agent loop for a retail business.
+A small Python project that demonstrates an LLM agent loop for a retail business. It uses Google's Gemini Developer API through the official `google-genai` Python SDK.
 
 ## What it can do
 
@@ -8,7 +8,7 @@ A small Python project that demonstrates an LLM agent loop for a retail business
 - Search for a product and retrieve its price.
 - Prepare an order draft after collecting product quantities and a complete address.
 - Confirm a draft only after a clear approval in the customer's latest message.
-- Keep a conversation linked to a customer ID using the Responses API response chain.
+- Keep a short conversation history per customer in SQLite.
 
 ## Safety and scope
 
@@ -18,8 +18,11 @@ The product names, prices, and stock in `shop/database.py` are demo data only. R
 
 ## Requirements
 
-- Python 3.10 or later
-- An OpenAI API key with access to a tool-calling model
+- Python 3.9 or later
+- A Gemini API key from Google AI Studio
+- Access to the selected Gemini model under your Google AI Studio account
+
+The default model is `gemini-3.8-flash`. Google's Gemini Developer API pricing page currently lists free-tier access for selected models, but the free tier has rate limits and model availability can vary. It is not unlimited. Check the current [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing) before relying on it. On the free tier, Google says submitted content may be used to improve its products; review Google's terms before using customer or business data.
 
 ## Setup (macOS/Linux)
 
@@ -27,11 +30,19 @@ The product names, prices, and stock in `shop/database.py` are demo data only. R
 cd whatsapp_shop_agent
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and set `OPENAI_API_KEY`. Set `OPENAI_MODEL` to a tool-calling model available to your API account if the example model name is not enabled for you.
+Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then open `.env` and set:
+
+```env
+GEMINI_API_KEY=your_actual_gemini_api_key
+GEMINI_MODEL=gemini-3.8-flash
+```
+
+You do not need an OpenAI API key or the OpenAI Python package for this version.
 
 Run:
 
@@ -57,19 +68,32 @@ whatsapp_shop_agent/
 ├── requirements.txt
 ├── .env.example
 └── shop/
-    ├── config.py        # Environment settings
-    ├── database.py      # SQLite schema, sample catalogue, session storage
+    ├── config.py        # Gemini/API environment settings
+    ├── database.py      # SQLite schema, sample catalogue, session history
     ├── tools.py         # Business tools the model can call
-    └── agent.py         # OpenAI Responses API + agent loop
+    └── agent.py          # Gemini function calling + agent loop
 ```
 
-## How the agent loop works
+## How the Gemini agent loop works
 
-1. `ShopAgent` sends the user's message, instructions, and tool schemas to the model.
-2. The model either returns a final text answer or requests one or more function calls.
-3. `ShopTools.dispatch()` routes each call to a Python function.
-4. The application returns each tool result to the model with its `call_id`.
-5. The model can call another tool or produce a final response. The loop has a maximum iteration limit.
+1. `ShopAgent` sends the customer's message, system instructions, and Gemini function declarations to the model.
+2. Gemini either returns final text or one or more function calls.
+3. `ShopTools.dispatch()` routes each function call to a Python business function.
+4. The application sends function responses back to Gemini as tool-role content.
+5. Gemini can request more tools or return a final answer. The loop has a maximum iteration limit.
+6. The application saves a compact user/model conversation history per customer in SQLite for the next message.
+
+The app manually executes function calls instead of enabling SDK automatic function calling. This makes the agent loop visible and easier to learn.
+
+## Existing database migration
+
+If you already ran the OpenAI version and have a `shop.db`, the updated code adds a `conversation_history` column to `customer_sessions` on startup. It does not delete the product or order tables. The old OpenAI `previous_response_id` column is left in place but is no longer used.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Next milestones
 

@@ -1,5 +1,6 @@
-.env
 __pycache__/
 *.py[cod]
 shop.db
 .venv/
+config.bat
+node_modules

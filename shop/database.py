@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from shop.config import Settings
 
@@ -69,10 +70,25 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS customer_sessions (
                     customer_id TEXT PRIMARY KEY,
-                    previous_response_id TEXT
+                    previous_response_id TEXT,
+                    conversation_history TEXT NOT NULL DEFAULT '[]'
                 );
                 """
             )
+
+            # Migrate an existing database created by the OpenAI version.
+            # Keep previous_response_id so the existing database is not destructively changed.
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(customer_sessions)"
+                ).fetchall()
+            }
+            if "conversation_history" not in columns:
+                connection.execute(
+                    "ALTER TABLE customer_sessions "
+                    "ADD COLUMN conversation_history TEXT NOT NULL DEFAULT '[]'"
+                )
 
             product_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM products"
@@ -84,24 +100,44 @@ class Database:
                     DEMO_PRODUCTS,
                 )
 
-    def get_previous_response_id(self, customer_id: str) -> str | None:
+    def get_conversation_history(self, customer_id: str) -> list[dict[str, str]]:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT previous_response_id FROM customer_sessions WHERE customer_id = ?",
+                "SELECT conversation_history FROM customer_sessions WHERE customer_id = ?",
                 (customer_id,),
             ).fetchone()
-            return row["previous_response_id"] if row else None
 
-    def save_previous_response_id(
-        self, customer_id: str, response_id: str
+        if row is None:
+            return []
+
+        try:
+            history = json.loads(row["conversation_history"] or "[]")
+        except json.JSONDecodeError:
+            return []
+
+        if not isinstance(history, list):
+            return []
+
+        # Ignore malformed records rather than breaking the customer's next message.
+        return [
+            entry
+            for entry in history
+            if isinstance(entry, dict)
+            and entry.get("role") in {"user", "model"}
+            and isinstance(entry.get("text"), str)
+        ]
+
+    def save_conversation_history(
+        self, customer_id: str, history: list[dict[str, Any]]
     ) -> None:
+        serialized_history = json.dumps(history, ensure_ascii=False)
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO customer_sessions (customer_id, previous_response_id)
+                INSERT INTO customer_sessions (customer_id, conversation_history)
                 VALUES (?, ?)
                 ON CONFLICT(customer_id)
-                DO UPDATE SET previous_response_id = excluded.previous_response_id
+                DO UPDATE SET conversation_history = excluded.conversation_history
                 """,
-                (customer_id, response_id),
+                (customer_id, serialized_history),
             )

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 from shop.config import Settings
 from shop.database import Database
@@ -15,7 +15,7 @@ You are ShopBot, a helpful WhatsApp sales assistant for a retail business in Ind
 
 Your responsibilities:
 - Answer product availability questions using list_products or search_products.
-- Answer price questions using get_product_details or the current catalogue results.
+- Answer price questions using get_product_details or current catalogue results.
 - Help customers prepare an order using prepare_order.
 - Confirm an order only after the customer clearly approves the exact draft order.
 
@@ -40,66 +40,140 @@ Business rules:
 """.strip()
 
 
+def _remove_unsupported_schema_fields(value: Any) -> Any:
+    """Convert our provider-neutral JSON schema into Gemini-compatible JSON schema."""
+    if isinstance(value, dict):
+        # OpenAI's strict mode uses additionalProperties=false. Gemini function
+        # declarations use parameters_json_schema, so omit that provider-specific key.
+        return {
+            key: _remove_unsupported_schema_fields(item)
+            for key, item in value.items()
+            if key != "additionalProperties"
+        }
+    if isinstance(value, list):
+        return [_remove_unsupported_schema_fields(item) for item in value]
+    return value
+
+
+def build_gemini_tools() -> list[types.Tool]:
+    """Translate the project's tool schemas into Google's function declarations."""
+    declarations = []
+
+    for definition in TOOL_DEFINITIONS:
+        declarations.append(
+            types.FunctionDeclaration(
+                name=definition["name"],
+                description=definition["description"],
+                parameters_json_schema=_remove_unsupported_schema_fields(
+                    definition["parameters"]
+                ),
+            )
+        )
+
+    return [types.Tool(function_declarations=declarations)]
+
+
 class ShopAgent:
     def __init__(self, settings: Settings, database: Database) -> None:
-        self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = settings.openai_model
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.model = settings.gemini_model
         self.max_iterations = settings.max_agent_iterations
         self.database = database
+        self.tools = build_gemini_tools()
+
+    def _generate(self, contents: list[types.Content]):
+        return self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                tools=self.tools,
+                temperature=0.2,
+            ),
+        )
+
+    @staticmethod
+    def _text_content(role: str, text: str) -> types.Content:
+        return types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=text)],
+        )
 
     def handle_message(self, customer_id: str, message: str) -> str:
-        previous_response_id = self.database.get_previous_response_id(customer_id)
+        # Gemini's generate_content API receives the conversation as a list of
+        # Content objects. We persist a compact user/model text history per customer.
+        history = self.database.get_conversation_history(customer_id)
+        contents = [
+            self._text_content(entry["role"], entry["text"])
+            for entry in history
+            if entry.get("role") in {"user", "model"} and entry.get("text")
+        ]
+        contents.append(self._text_content("user", message))
+
         tool_runner = ShopTools(self.database, customer_id, message)
+        response = self._generate(contents)
 
-        request: dict[str, Any] = {
-            "model": self.model,
-            "instructions": SYSTEM_PROMPT,
-            "tools": TOOL_DEFINITIONS,
-            "input": [{"role": "user", "content": message}],
-        }
-        if previous_response_id:
-            request["previous_response_id"] = previous_response_id
-
-        response = self.client.responses.create(**request)
-
-        # This is the agent loop: execute each requested tool, return its output to the
-        # model, and repeat until the model produces a normal text answer.
-        for _ in range(self.max_iterations):
-            function_calls = [
-                item for item in response.output if item.type == "function_call"
-            ]
+        # Agent loop: the model requests tools, Python executes them, and the
+        # results are sent back to Gemini. Repeat until Gemini returns text.
+        for iteration in range(self.max_iterations + 1):
+            function_calls = response.function_calls or []
 
             if not function_calls:
-                self.database.save_previous_response_id(customer_id, response.id)
-                return response.output_text or "I couldn't generate a response. Could you rephrase that?"
+                answer = response.text or (
+                    "I couldn't generate a response. Could you rephrase that?"
+                )
+                updated_history = history + [
+                    {"role": "user", "text": message},
+                    {"role": "model", "text": answer},
+                ]
+                # Keep the most recent 20 messages (10 user/assistant turns).
+                self.database.save_conversation_history(
+                    customer_id, updated_history[-20:]
+                )
+                return answer
 
-            tool_outputs = []
-            for call in function_calls:
-                try:
-                    arguments = json.loads(call.arguments)
-                    result = tool_runner.dispatch(call.name, arguments)
-                except json.JSONDecodeError:
-                    result = {"error": "The model supplied invalid JSON tool arguments."}
-
-                print(f"  [tool] {call.name}({call.arguments})")
-                print(f"  [tool result] {result}")
-
-                tool_outputs.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": json.dumps(result, ensure_ascii=False),
-                    }
+            if iteration == self.max_iterations:
+                raise RuntimeError(
+                    f"Agent exceeded its limit of {self.max_iterations} tool-calling iterations."
                 )
 
-            response = self.client.responses.create(
-                model=self.model,
-                instructions=SYSTEM_PROMPT,
-                tools=TOOL_DEFINITIONS,
-                previous_response_id=response.id,
-                input=tool_outputs,
+            # Keep Gemini's original model content, including the function-call
+            # parts and any model metadata required for the next tool response.
+            if not response.candidates or not response.candidates[0].content:
+                raise RuntimeError(
+                    "Gemini requested a tool but returned no candidate content."
+                )
+            contents.append(response.candidates[0].content)
+
+            function_response_parts = []
+            for function_call in function_calls:
+                tool_name = function_call.name
+                arguments = dict(function_call.args or {})
+
+                try:
+                    result = tool_runner.dispatch(tool_name, arguments)
+                except Exception as error:  # Return tool failures to the model as observations.
+                    result = {"error": f"Tool execution failed: {error}"}
+
+                print(f"  [tool] {tool_name}({arguments})")
+                print(f"  [tool result] {result}")
+
+                function_response_parts.append(
+                    types.Part.from_function_response(
+                        name=tool_name,
+                        response={"result": result},
+                    )
+                )
+
+            contents.append(
+                types.Content(
+                    role="tool",
+                    parts=function_response_parts,
+                )
             )
 
-        raise RuntimeError(
-            f"Agent exceeded its limit of {self.max_iterations} iterations."
-        )
+            response = self._generate(contents)
+
+    def close(self) -> None:
+        """Release the SDK's HTTP resources when the application exits."""
+        self.client.close()
